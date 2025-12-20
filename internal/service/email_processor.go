@@ -20,14 +20,22 @@ const (
 type EmailProcessor struct {
 	accountRepo      *repository.AccountRepository
 	emailSyncJobRepo *repository.EmailSyncJobRepository
-	emailRepo        *repository.EmailRepository
+	llmSyncJobRepo   *repository.LLMSyncJobRepository
 	gmailClient      GmailClient // Interface for Gmail API
 }
 
 // GmailClient interface for Gmail API operations
 type GmailClient interface {
+	FetchMessageIDs(ctx context.Context, accessToken string, query string, maxResults int, pageToken string) (*MessageIDFetchResult, error)
+	FetchEmailByID(ctx context.Context, accessToken string, messageID string) (*EmailMessage, error)
 	FetchEmails(ctx context.Context, accessToken string, query string, maxResults int, pageToken string) (*EmailFetchResult, error)
 	RefreshAccessToken(ctx context.Context, refreshToken string) (*TokenRefreshResult, error)
+}
+
+type MessageIDFetchResult struct {
+	MessageIDs    []string
+	NextPageToken string
+	TotalFetched  int
 }
 
 type EmailFetchResult struct {
@@ -65,13 +73,13 @@ type TokenRefreshResult struct {
 func NewEmailProcessor(
 	accountRepo *repository.AccountRepository,
 	emailSyncJobRepo *repository.EmailSyncJobRepository,
-	emailRepo *repository.EmailRepository,
+	llmSyncJobRepo *repository.LLMSyncJobRepository,
 	gmailClient GmailClient,
 ) *EmailProcessor {
 	return &EmailProcessor{
 		accountRepo:      accountRepo,
 		emailSyncJobRepo: emailSyncJobRepo,
-		emailRepo:        emailRepo,
+		llmSyncJobRepo:   llmSyncJobRepo,
 		gmailClient:      gmailClient,
 	}
 }
@@ -125,55 +133,43 @@ func (p *EmailProcessor) ProcessEmailSyncJob(ctx context.Context, job *models.Em
 		pageToken = *job.PageToken
 	}
 
-	log.Printf("Fetching %d emails for account %s (page_token: %s)", batchSize, job.AccountID, pageToken)
+	log.Printf("Fetching %d message IDs for account %s (page_token: %s)", batchSize, job.AccountID, pageToken)
 
-	result, err := p.gmailClient.FetchEmails(ctx, accessToken, query, batchSize, pageToken)
+	result, err := p.gmailClient.FetchMessageIDs(ctx, accessToken, query, batchSize, pageToken)
 	if err != nil {
-		return fmt.Errorf("failed to fetch emails: %w", err)
+		return fmt.Errorf("failed to fetch message IDs: %w", err)
 	}
 
-	log.Printf("Fetched %d emails for account %s", len(result.Messages), job.AccountID)
+	log.Printf("Fetched %d message IDs for account %s", len(result.MessageIDs), job.AccountID)
 
-	// Store emails in database for LLM fine-tuning
-	if len(result.Messages) > 0 {
-		emails := make([]models.Email, 0, len(result.Messages))
-		for _, msg := range result.Messages {
-			email := models.Email{
-				ID:             uuid.New().String(),
-				AccountID:      job.AccountID,
-				GmailMessageID: msg.ID,
-				GmailThreadID:  stringPtr(msg.ThreadID),
-				From:           stringPtr(msg.From),
-				To:             stringPtr(msg.To),
-				CC:             stringPtr(msg.CC),
-				BCC:            stringPtr(msg.BCC),
-				Subject:        stringPtr(msg.Subject),
-				BodyText:       stringPtr(msg.BodyText),
-				BodyHTML:       stringPtr(msg.BodyHTML),
-				Snippet:        stringPtr(msg.Snippet),
-				ReceivedAt:     timePtr(msg.Date),
-				InternalDate:   timePtr(msg.InternalDate),
-				Labels:         msg.Labels,
-				RawHeaders:     msg.RawHeaders,
-				RawPayload:     msg.RawPayload,
-				HasAttachments: msg.HasAttachments,
-				Attachments:    msg.Attachments,
-				CreatedAt:      time.Now(),
-				UpdatedAt:      time.Now(),
+	// Create LLM sync jobs for each message ID
+	if len(result.MessageIDs) > 0 {
+		llmJobs := make([]models.LLMSyncJob, 0, len(result.MessageIDs))
+		now := time.Now()
+
+		for _, messageID := range result.MessageIDs {
+			llmJob := models.LLMSyncJob{
+				ID:           uuid.New().String(),
+				AccountID:    job.AccountID,
+				MessageID:    messageID,
+				Status:       models.LLMStatusPending,
+				LastSyncedAt: nil, // NULL = new job, gets priority in round-robin
+				Attempts:     0,
+				CreatedAt:    now,
+				UpdatedAt:    now,
 			}
-			emails = append(emails, email)
-			log.Printf("  - Email: %s | From: %s | Date: %s", msg.Subject, msg.From, msg.Date.Format("2006-01-02"))
+			llmJobs = append(llmJobs, llmJob)
 		}
 
-		// Bulk insert emails
-		if err := p.emailRepo.BulkCreate(ctx, emails); err != nil {
-			return fmt.Errorf("failed to store emails: %w", err)
+		// Bulk create LLM sync jobs
+		if err := p.llmSyncJobRepo.BulkCreate(ctx, llmJobs); err != nil {
+			return fmt.Errorf("failed to create LLM sync jobs: %w", err)
 		}
-		log.Printf("Stored %d emails in database", len(emails))
+		log.Printf("Created %d LLM sync jobs for account %s", len(llmJobs), job.AccountID)
 	}
 
 	// Update job progress
-	newEmailsFetched := job.EmailsFetched + len(result.Messages)
+	newEmailsFetched := job.EmailsFetched + len(result.MessageIDs)
 	var nextPageToken *string
 	if result.NextPageToken != "" {
 		nextPageToken = &result.NextPageToken
@@ -266,19 +262,4 @@ func (p *EmailProcessor) CreateInitialEmailSyncJob(ctx context.Context, accountI
 
 	log.Printf("Created initial email sync job %s for account %s (will be picked first)", job.ID, accountID)
 	return nil
-}
-
-// Helper functions for pointer conversion
-func stringPtr(s string) *string {
-	if s == "" {
-		return nil
-	}
-	return &s
-}
-
-func timePtr(t time.Time) *time.Time {
-	if t.IsZero() {
-		return nil
-	}
-	return &t
 }
